@@ -1,0 +1,110 @@
+From 0c39fad170911edb62f29f60147466abca7862e0 Mon Sep 17 00:00:00 2001
+From: Jens Steube <jens.steube@gmail.com>
+Date: Tue, 27 Oct 2026 22:02:50 +0100
+Subject: [PATCH] Prevent out of bounds device writes in RACF modes
+
+Modes 14200 and 37500 read a memory factor from the 32 character RACF header and use it to determine a kernel loop bound and an index into racf_kdfaes_tmp->out, a buffer of 256 words. Mode 37500 did not validate the factor. Mode 14200 rejected values above 10 but accepted values from 1 through 4, which become 0 in the subsequent division. A factor of 000B makes mode 37500 write to out[256] through out[511], while 0001 makes mode 14200 index out[] at 8 * (0 - 1). Both cases can be triggered by a hash file.
+
+Both parsers now reject memory factors outside the range 5 through 10. A factor of 10 fills the buffer exactly, while factors below 5 produce 0 after division. Mode 37500 now also performs the shift on an unsigned value, as mode 14200 already did, so the shift remains defined regardless of the header value.
+
+The repetition factor from the same header was also unchecked in both modes. It determines two iteration counts, each one less than a multiple of the factor. A factor of 0 therefore produced 0xffffffff for both counts, and both parsers now reject it.
+
+Both init2 kernels also return early when the memory factor is 0. That keeps the unconditional tail write at the end of each from indexing out[] at 8 * (0 - 1) if a future parser change ever allows 0 through.
+---
+ OpenCL/m14200-pure.cl      |  5 +++++
+ OpenCL/m37500-pure.cl      |  5 +++++
+ src/modules/module_14200.c | 10 ++++++++--
+ src/modules/module_37500.c | 13 ++++++++++++-
+ tools/fuzz/fuzz_parse.dict |  1 +
+ 5 files changed, 31 insertions(+), 3 deletions(-)
+
+diff --git a/OpenCL/m14200-pure.cl b/OpenCL/m14200-pure.cl
+index fc2ce95ed9..86e77dd6df 100644
+--- a/OpenCL/m14200-pure.cl
++++ b/OpenCL/m14200-pure.cl
+@@ -590,6 +590,11 @@ KERNEL_FQ KERNEL_FA void m14200_init2 (KERN_ATTR_TMPS_ESALT (racf_kdfaes_tmp_t,
+ 
+   if (gid >= GID_CNT) return;
+ 
++  // The parser rejects a mem_fac that divides to 0. The tail write at the end of this kernel
++  // would index out[] at 8 * (0 - 1) if one ever reached here.
++
++  if (esalt_bufs[DIGESTS_OFFSET_HOST].mem_fac == 0) return;
++
+   tmps[gid].key[0] = tmps[gid].salt_buf[4];
+   tmps[gid].key[1] = tmps[gid].salt_buf[5];
+   tmps[gid].key[2] = tmps[gid].salt_buf[6];
+diff --git a/OpenCL/m37500-pure.cl b/OpenCL/m37500-pure.cl
+index 1070e3ae33..a77f5165e3 100644
+--- a/OpenCL/m37500-pure.cl
++++ b/OpenCL/m37500-pure.cl
+@@ -531,6 +531,11 @@ KERNEL_FQ KERNEL_FA void m37500_init2 (KERN_ATTR_TMPS_ESALT (racf_kdfaes_tmp_t,
+ 
+   if (gid >= GID_CNT) return;
+ 
++  // The parser rejects a mem_fac that divides to 0. The tail write at the end of this kernel
++  // would index out[] at 8 * (0 - 1) if one ever reached here.
++
++  if (esalt_bufs[DIGESTS_OFFSET_HOST].mem_fac == 0) return;
++
+   tmps[gid].key[0] = tmps[gid].salt_buf[4];
+   tmps[gid].key[1] = tmps[gid].salt_buf[5];
+   tmps[gid].key[2] = tmps[gid].salt_buf[6];
+diff --git a/src/modules/module_14200.c b/src/modules/module_14200.c
+index a203f59df8..e831ea7e21 100644
+--- a/src/modules/module_14200.c
++++ b/src/modules/module_14200.c
+@@ -259,9 +259,15 @@ int module_hash_decode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSE
+    */
+   // mem_fac is four hex digits off the line, so it reaches 0xffff, and the shift below is then
+   // undefined rather than large. The buffer it sizes is racf_kdfaes_tmp->out, u32[256], which is
+-  // what a mem_fac of 10 fills, and a mem_fac of 0 would shift by -1.
++  // what a mem_fac of 10 fills. Below 5 the division gives 0, and the kernel then indexes out[]
++  // with 8 * (0 - 1).
+ 
+-  if ((mem_fac < 1) || (mem_fac > 10)) return (PARSER_SALT_VALUE);
++  if ((mem_fac < 5) || (mem_fac > 10)) return (PARSER_SALT_VALUE);
++
++  // rep_fac comes off the same header and sets both iteration counts, each one less than a
++  // multiple of it, so a rep_fac of 0 makes them 0xffffffff.
++
++  if (rep_fac == 0) return (PARSER_SALT_ITERATION);
+ 
+   racf_kdfaes->mem_fac = (2u << (mem_fac - 1)) / 32;
+   /**
+diff --git a/src/modules/module_37500.c b/src/modules/module_37500.c
+index 0b19c3009b..37ed810782 100644
+--- a/src/modules/module_37500.c
++++ b/src/modules/module_37500.c
+@@ -248,7 +248,18 @@ int module_hash_decode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSE
+   rep_fac |= ((u32) hex_convert (header_pos[20+3]) <<  0);
+   rep_fac |= ((u32) hex_convert (header_pos[20+2]) <<  4);
+ 
+-  racf_kdfaes->mem_fac = (2 << (mem_fac - 1)) / 32;
++  // Both factors are four hex digits off the line and reach 0xffff. The buffer mem_fac sizes is
++  // racf_kdfaes_tmp->out, u32[256], which is what a mem_fac of 10 fills. Below 5 the division
++  // gives 0, and the kernel then indexes out[] with 8 * (0 - 1).
++
++  if ((mem_fac < 5) || (mem_fac > 10)) return (PARSER_SALT_VALUE);
++
++  // rep_fac sets both iteration counts, each one less than a multiple of it, so a rep_fac of 0
++  // makes them 0xffffffff.
++
++  if (rep_fac == 0) return (PARSER_SALT_ITERATION);
++
++  racf_kdfaes->mem_fac = (2u << (mem_fac - 1)) / 32;
+   racf_kdfaes->rep_fac = rep_fac;
+ 
+   // salt (save to racf_kdfaes->salt_buf and salt->salt_buf)
+diff --git a/tools/fuzz/fuzz_parse.dict b/tools/fuzz/fuzz_parse.dict
+index ee7443be8a..04a117e50b 100644
+--- a/tools/fuzz/fuzz_parse.dict
++++ b/tools/fuzz/fuzz_parse.dict
+@@ -29,6 +29,7 @@
+ "$office$"
+ "$RAR3$"
+ "$7z$"
++"$racf-kdfaes$*"
+ 
+ "0123456789abcdef"
+ "deadbeef"

@@ -1,0 +1,160 @@
+From 694ddd0f2c93434536946791337d0f6085faee46 Mon Sep 17 00:00:00 2001
+From: Jens Steube <jens.steube@gmail.com>
+Date: Mon, 26 Oct 2026 20:06:41 +0100
+Subject: [PATCH] Limit Argon2 tag lengths and time out the brain handshake
+
+Mode 34000 took the Argon2 tag length from the hash line and checked it only against the 128 byte digest buffer. The kernel passed argon2_final() a 32 byte array, but argon2_final() writes digest_len / 4 words, so a tag longer than 32 bytes wrote past the end of that array on the device. Tags longer than 64 bytes also caused reads beyond the blake2b state. Both lengths were controlled by the hash line, so a hash file was enough to trigger either case. A 48 or 64 byte tag could still crack successfully because the comparison matched even after 12 or 16 words had been written into an eight word array, with no failure or warning.
+
+The kernel now uses a 16 word array, as the Argon2 modes that already support 64 byte tags do. The parser accepts tags from 16 to 64 bytes. The upper limit comes from the 64 byte blake2b state used to construct the tag. Below 16 bytes, the kernel passed unwritten words to COMPARE, which explains why an 8 byte tag never cracked. The other three modes using argon2_final() are unaffected. One already allocates room for 64 bytes, one requires a single tag length, and one sets the length internally.
+
+The brain server reserves one of its 255 client slots before authentication, then reads the protocol version and challenge response without a deadline or socket receive timeout. A peer could connect and send nothing, keeping its slot indefinitely. With 255 such connections, the server refused every subsequent connection with "Too many clients", even though none of those peers had supplied a password.
+
+The socket now has a 10 second receive timeout during the handshake, which is removed once the password is accepted. A failed read already releases the slot and closes the socket, so no new error path was needed. The timeout must be removed because an authenticated client can spend minutes processing a slow hash between requests. This is a denial of service against a server started with --brain-server, with no memory corruption or code execution. SECURITY.md already places resource exhaustion by a peer before authentication within the trust boundary.
+---
+ OpenCL/m34000-pure.cl      |  7 ++++-
+ include/brain.h            |  8 ++++++
+ src/brain.c                | 56 ++++++++++++++++++++++++++++++++++++++
+ src/modules/module_34000.c | 12 +++++++-
+ 4 files changed, 81 insertions(+), 2 deletions(-)
+
+diff --git a/OpenCL/m34000-pure.cl b/OpenCL/m34000-pure.cl
+index 1a48f5db22..4b666e5ae6 100644
+--- a/OpenCL/m34000-pure.cl
++++ b/OpenCL/m34000-pure.cl
+@@ -148,7 +148,12 @@ KERNEL_FQ KERNEL_FA void m34000_comp (KERN_ATTR_TMPS_ESALT (argon2_tmp_t, merged
+ 
+   GLOBAL_AS argon2_block_t *argon2_block = get_argon2_block (&argon2_options, V, gd4);
+ 
+-  u32 out[8];
++  // 16 words, because argon2_final () writes digest_len / 4 of them and digest_len comes from the
++  // tag in the hash line. The construction produces the tag out of the 64 byte blake2b state, so 16
++  // is the most it can ever fill, and the parser refuses a longer tag. This held 8 words, which a
++  // tag over 32 bytes wrote straight past. m34100-pure.cl sizes the same array the same way.
++
++  u32 out[16];
+ 
+   argon2_final (argon2_block, &argon2_options, out);
+ 
+diff --git a/include/brain.h b/include/brain.h
+index be38d98bcf..6d43a590cd 100644
+--- a/include/brain.h
++++ b/include/brain.h
+@@ -46,6 +46,14 @@ static const int BRAIN_SERVER_TIMER               = 5 * 60;
+ static const int BRAIN_SERVER_SESSIONS_MAX        = 64;
+ static const int BRAIN_SERVER_ATTACKS_MAX         = 64 * 1024;
+ static const int BRAIN_SERVER_CLIENTS_MAX         = 256;
++
++// How long a connection may take to get through the handshake. A connection that is still in it
++// holds one of the slots above, so without a deadline a peer that connects and sends nothing holds
++// a slot for as long as it likes. The deadline covers the handshake only, never the session after
++// it, so it has to be generous enough for a slow link and short enough that filling every slot
++// takes continuous effort rather than one burst.
++
++static const int BRAIN_SERVER_HANDSHAKE_TIMEOUT   = 10;
+ static const int BRAIN_SERVER_REALLOC_ATTACK_SIZE = 1024;
+ static const int BRAIN_HASH_SIZE                  = 2 * sizeof (u32);
+ // The wire format changed when brain_auth_hash moved from a checksum to SHA-256, so a client and
+diff --git a/src/brain.c b/src/brain.c
+index 79269b352d..9fe4cc2859 100644
+--- a/src/brain.c
++++ b/src/brain.c
+@@ -2499,6 +2499,32 @@ HC_THREAD_FUNC brain_server_handle_dumps (void *p)
+   return 0;
+ }
+ 
++// A receive deadline on one client socket. Seconds of 0 removes it, which is what both platforms
++// read as "block until something arrives".
++//
++// brain_recv_all () treats any recv () that does not return bytes as a failed read, so a socket that
++// times out takes the client's error path, and that path already frees the slot and closes the fd.
++
++static bool brain_server_set_recv_timeout (int client_fd, const int seconds)
++{
++  #if defined (_WIN)
++
++  DWORD timeout = (DWORD) seconds * 1000;
++
++  #else
++
++  struct timeval timeout;
++
++  timeout.tv_sec  = seconds;
++  timeout.tv_usec = 0;
++
++  #endif
++
++  if (setsockopt (client_fd, SOL_SOCKET, SO_RCVTIMEO, (const char *) &timeout, sizeof (timeout)) == -1) return false;
++
++  return true;
++}
++
+ HC_THREAD_FUNC brain_server_handle_client (void *p)
+ {
+   brain_server_client_options_t *brain_server_client_options = (brain_server_client_options_t *) p;
+@@ -2532,6 +2558,21 @@ HC_THREAD_FUNC brain_server_handle_client (void *p)
+ 
+   #endif
+ 
++  // The handshake is on the clock from here. The slot this connection holds was taken before any of
++  // it ran, so a peer that never finishes authenticating used to keep the slot indefinitely, and 255
++  // such peers filled the server without ever supplying a password.
++
++  if (brain_server_set_recv_timeout (client_fd, BRAIN_SERVER_HANDSHAKE_TIMEOUT) == false)
++  {
++    brain_logging (stderr, client_idx, "setsockopt: %s\n", strerror (errno));
++
++    brain_server_dbs->client_slots[client_idx] = 0;
++
++    close (client_fd);
++
++    return 0;
++  }
++
+   u32 brain_link_version = 0;
+ 
+   if (brain_recv (client_fd, &brain_link_version, sizeof (brain_link_version), 0, NULL, NULL) == false)
+@@ -2621,6 +2662,21 @@ HC_THREAD_FUNC brain_server_handle_client (void *p)
+     return 0;
+   }
+ 
++  // Authenticated, so the deadline comes off. A cracking client waits on its own run between
++  // requests, which on a slow hash is minutes, and cutting it off there would be a worse bug than
++  // the one the deadline is for.
++
++  if (brain_server_set_recv_timeout (client_fd, 0) == false)
++  {
++    brain_logging (stderr, client_idx, "setsockopt: %s\n", strerror (errno));
++
++    brain_server_dbs->client_slots[client_idx] = 0;
++
++    close (client_fd);
++
++    return 0;
++  }
++
+   u32 brain_session = 0;
+ 
+   if (brain_recv (client_fd, &brain_session, sizeof (brain_session), 0, NULL, NULL) == false)
+diff --git a/src/modules/module_34000.c b/src/modules/module_34000.c
+index ff9344c34f..be29c8e98f 100644
+--- a/src/modules/module_34000.c
++++ b/src/modules/module_34000.c
+@@ -208,7 +208,17 @@ int module_hash_decode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSE
+ 
+   tmp_len = base64_decode (base64_to_int, (const u8 *) digest_pos, digest_len, tmp_buf);
+ 
+-  if (tmp_len > (int) DGST_SIZE) return (PARSER_HASH_LENGTH);
++  // The tag length is bounded by what the kernel can compute and compare, not by the digest buffer.
++  //
++  // argon2_final () builds the tag from the 64 byte blake2b state, so 64 bytes is the longest tag it
++  // can produce, and it writes digest_len / 4 words into the kernel's array. A longer tag used to be
++  // accepted here and then written past the end of that array on the device.
++  //
++  // The lower bound is the comparison: the kernel hands 4 words to COMPARE, so a tag under 16 bytes
++  // left words it never wrote to decide whether a candidate matched.
++
++  if (tmp_len < 16) return (PARSER_HASH_LENGTH);
++  if (tmp_len > 64) return (PARSER_HASH_LENGTH);
+ 
+   memcpy (digest, tmp_buf, tmp_len);
+ 
